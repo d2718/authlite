@@ -303,7 +303,7 @@ func Configure(cfg_path string) error {
 func generate_key() string {
     max_n := len(key_runes)
     k := make([]rune, key_length)
-    for n := 0; n < max_n; n++ {
+    for n := 0; n < key_length; n++ {
         k[n] = key_runes[rand.Intn(max_n)]
     }
     return string(k)
