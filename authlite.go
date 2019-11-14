@@ -5,7 +5,7 @@
 //
 // https://github.com/d2718/authlite
 //
-// 2019-11-12
+// 2019-11-14
 //
 package authlite
 
@@ -15,10 +15,13 @@ import( "encoding/csv"; "errors"; "fmt"; "io/ioutil"; "log"; "math/rand";
         "github.com/d2718/dconfig";
 )
 
-const DEBUG bool = true
+const DEBUG bool = false
 
+// This one sync.Mutex protects both files.
 var file_mu *sync.Mutex
 var hash_file, key_file string
+// None of these four are protected by mutices because they should only ever be
+// changed during the explicitly-non-thread-safe Configure().
 var key_length   int = 32
 var key_runes []rune = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 var hash_cost    int = 5
@@ -43,8 +46,31 @@ var(
     ErrBadKey      = fmt.Errorf("nonexistent or expired key")
 )
 
-func UsersDirty() bool { return udirty }
-func KeysDirty()  bool { return kdirty }
+// UsersDirty() returns true if changes have been made to the user data
+// (users have been added or deleted) since the last time the user data
+// was read from or flushed to disk.
+//
+func UsersDirty() bool {
+    umu.RLock()
+    b := udirty
+    umu.RUnlock()
+    return b
+}
+
+// KeysDirty() returns true if changes have been made to the key data
+// (session keys have been added or culled) since the last time the key
+// data was read from or flushed to disk.
+//
+func KeysDirty()  bool {
+    kmu.RLock()
+    b := kdirty
+    kmu.RUnlock()
+    return b
+}
+
+// ensure_exists_writably() is used by Configure() (below) to ensure that
+// the files for storing password hashes and session keys exist and are
+// writable. It will attempt to create them if they are not.
 
 func ensure_exists_writably(path string) error {
     fi, err := os.Stat(path)
@@ -73,6 +99,14 @@ func ensure_exists_writably(path string) error {
 //
 // uname,hashed_pwd_as_string
 
+// LoadUsers() attempts to load username/password hash data from the file
+// specified in the USER_FILE configuation option. If current user data
+// has changed (by adding or deleting users, say) since the last time
+// FlushUsers() (below) was called, those changes will be lost.
+//
+// When successful, LoadUsers() will flag the user data as "clean", and
+// UsersDirty() (above) will return false until a change is made.
+//
 func LoadUsers() error {
     log.Printf("LoadUsers() called")
     if hash_file == "" {
@@ -115,16 +149,21 @@ func LoadUsers() error {
     return nil
 }
 
+// FlushUsers() writes all user data (usernames and password hashes) to the
+// file specified with the USER_FILE configuration option. On success it will
+// flag the user data as "clean", and UsersDirty() (above) will return false
+// until a change is made.
+//
 func FlushUsers() error {
     log.Printf("FlushUsers() called")
     if hash_file == "" {
         return fmt.Errorf("No USER_FILE set. Try calling Configure() first.")
     }
     
-    umu.RLock()
+    umu.Lock()
     file_mu.Lock()
     defer file_mu.Unlock()
-    defer umu.RUnlock()
+    defer umu.Unlock()
     
     f, err := os.OpenFile(hash_file, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 644)
     if err != nil {
@@ -163,6 +202,12 @@ func FlushUsers() error {
 //
 // uname,exptime,key
 
+// LoadKeys() attempts to load data about temporary session keys from the
+// file specified with the KEY_FILE configuration option. It will ignore
+// expired keys. On success it will flag the key data as "clean", and
+// KeysDirty() will return false until a new key is issued or old keys
+// are culled.
+//
 func LoadKeys() error {
     log.Printf("LoadKeys() called")
     if key_file == "" {
@@ -208,6 +253,11 @@ func LoadKeys() error {
     return nil
 }
 
+// FlushKeys() writes session key data to the file specified in the KEY_FILE
+// configuration option. Ignores expired keys (they will not be written).
+// On success it will flag the key data as "clean", and KeysDirty() will
+// return false until a new key is issued or old keys are culled.
+//
 func FlushKeys() error {
     log.Printf("FlushKeys() called")
     if key_file == "" {
@@ -225,8 +275,8 @@ func FlushKeys() error {
     
     now := time.Now()
     var n_written int = 0
-    kmu.RLock()
-    defer kmu.RUnlock()
+    kmu.Lock()
+    defer kmu.Unlock()
     for k, v := range keys {
         if v.until.After(now) {
             err = w.Write([]string{ v.uname, fmt.Sprintf("%d", v.until.Unix()), k })
@@ -247,6 +297,16 @@ func FlushKeys() error {
     return nil
 }
 
+// Configure(cfg_path string) reads the configuration file at cfg_path, sets
+// options appropriately, and initializes everything that needs to be
+// initialized. It also calls LoadUsers() and LoadKeys() to load all data.
+//
+// Configure() IS NOT thread-safe. It should just be called once at the
+// beginning of your program, before any authorization needs to take place.
+// If you need to reconfigure this module mid-program, you can either try
+// introducing a careful locking dance, or ensuring all your auth-requiring
+// threads are stopped. I don't know which will be more painful.
+//
 func Configure(cfg_path string) error {
     log.Printf("Configure(%q) called", cfg_path)
     
@@ -259,9 +319,7 @@ func Configure(cfg_path string) error {
     dconfig.AddString(&key_char_str,  "key_chars",    dconfig.STRIP)
     dconfig.AddInt(&hash_cost,        "hash_cost",    dconfig.UNSIGNED)
     dconfig.AddInt(&key_life_cfg_int, "key_lifetime", dconfig.UNSIGNED)
-    file_mu.Lock()
     err := dconfig.Configure([]string{cfg_path}, true)
-    file_mu.Unlock()
     if err != nil {
         log.Printf("dconfig.Configure(...) returned error: %s", err.Error())
         return err
@@ -273,14 +331,11 @@ func Configure(cfg_path string) error {
         return fmt.Errorf("You must configure a KEY_FILE.")
     }
     
-    file_mu.Lock()
     err = ensure_exists_writably(hash_file)
     if err != nil {
-        file_mu.Unlock()
         return fmt.Errorf("error with user file: %s", err.Error())
     }
     err = ensure_exists_writably(key_file)
-    file_mu.Unlock()
     if err != nil {
         return fmt.Errorf("error with key file: %s", err.Error())
     }
@@ -309,26 +364,31 @@ func generate_key() string {
     return string(k)
 }
 
+// AddUser() adds a user with the supplied user name and password. Will
+// return ErrUserExists if the supplied user name already exists. Sets the
+// user data to "dirty" on success.
+//
 func AddUser(uname, pwd string) error {
-    umu.RLock()
+    umu.Lock()
+    defer umu.Unlock()
     if _, exists := users[uname]; exists {
         return ErrUserExists
     }
-    umu.RUnlock()
     
     pwd_hsh, err := bcrypt.GenerateFromPassword([]byte(pwd), hash_cost)
     if err != nil {
         return fmt.Errorf("Unable to hash password: %s", err.Error())
     }
     
-    umu.Lock()
     users[uname] = pwd_hsh
     udirty = true
-    umu.Unlock()
     
     return nil
 }
-
+// DeleteUser() removes the user with the supplied user name. Will return
+// ErrNotAUser if there is no user with the supplied user name. Sets the
+// user data to "dirty" on success.
+//
 func DeleteUser(uname string) error {
     umu.Lock()
     defer umu.Unlock()
@@ -341,6 +401,9 @@ func DeleteUser(uname string) error {
     }
 }
 
+// CheckPassword() returns whether the supplied username/password combo
+// checks out. Will return ErrNotAUser or ErrBadPassword as appropriate.
+//
 func CheckPassword(uname, pwd string) (bool, error) {
     umu.RLock()
     hsh, exists := users[uname]
@@ -349,9 +412,6 @@ func CheckPassword(uname, pwd string) (bool, error) {
         return false, ErrNotAUser
     }
     err := bcrypt.CompareHashAndPassword(hsh, []byte(pwd))
-    //
-    // TODO: Possibly alter this to give more information via the error
-    //
     if err == nil {
         return true, nil
     } else {
@@ -360,6 +420,9 @@ func CheckPassword(uname, pwd string) (bool, error) {
     }
 }
 
+// CheckKey() Checks to see whether the supplied key has been issued to
+// the supplied username and has not expired. Returns ErrBadKey on failure.
+//
 func CheckKey(uname, keystr string) (bool, error) {
     kmu.RLock()
     k, exists := keys[keystr]
@@ -374,6 +437,11 @@ func CheckKey(uname, keystr string) (bool, error) {
     return false, ErrBadKey
 }
 
+// CheckPasswordAndIssueKey() checks whether the username/password combo
+// checks out. If so, it will generate (and return) a new key associated with
+// that username. Returns an empty string and appropriate error if the
+// username/password combo is bad.
+//
 func CheckPasswordAndIssueKey(uname, pwd string) (string, error) {
     ok, err := CheckPassword(uname, pwd)
     if !ok {
@@ -387,6 +455,11 @@ func CheckPasswordAndIssueKey(uname, pwd string) (string, error) {
     return kstr, nil
 }
 
+// CheckAndRefreshKey() checks whether the supplied key has been issued to
+// the supplied username and has not expired; returns appropriate error
+// if not. If the username/key combo is good, the key's expiry time will
+// be reset (to now + key_lifetime), and key data will be set to "dirty".
+//
 func CheckAndRefreshKey(uname, keystr string) (bool, error) {
     ok, err := CheckKey(uname, keystr)
     if !ok { return false, err}
@@ -399,6 +472,9 @@ func CheckAndRefreshKey(uname, keystr string) (bool, error) {
     return true, nil
 }
 
+// CullOldKeys() grovels through issued keys and removes expired ones. If it
+// removes anything, it sets key data to "dirty".
+//
 func CullOldKeys() {
     old := make([]string, 0, 0)
     now := time.Now()
@@ -413,7 +489,9 @@ func CullOldKeys() {
     for _, kstr := range old {
         delete(keys, kstr)
     }
+    if len(old) > 0 { kdirty = true }
     kmu.Unlock()
+    return
 }
 
 func init() {
